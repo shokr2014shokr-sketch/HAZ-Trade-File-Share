@@ -1,9 +1,9 @@
 # ==========================================================
 # HAZ TRADE
 # STRATEGY : SwordStrategyV03
-# VERSION : V1.14
-# PHASE 2D
-# ENTRY EXECUTION CONFIRMATION
+# VERSION : V1.19
+# PHASE 2H
+# EARLY FAILURE EXIT V1.1 + ADD-ON V3 DIAGNOSTIC
 # ==========================================================
 from core.indicator_engine import cci_np, ema_np, lux_bbands_bo_np, supertrend_np, crossover_np, crossunder_np
 
@@ -45,8 +45,26 @@ class SwordStrategyV03:
         # ======================================================
         self.short_addon_count = 0
         self.long_addon_count = 0
+        self.short_addon_pending = False
+        self.long_addon_pending = False
+        self.short_addon_armed = False
+        self.long_addon_armed = False
+        self.addon_min_bars_after_mother = 2
+        self.addon_cci_strength = 120.0  # unused by Add-On logic
         self.prev_ema_sell = False
         self.prev_ema_buy = False
+        self.prev_lux_sell = False
+        self.prev_lux_buy = False
+        # ======================================================
+        # EARLY FAILURE EXIT V1.1 STATE
+        # ======================================================
+        self.early_failure_min_bars = 6
+        self.early_failure_max_bars = 12
+        self.early_failure_min_mfe_atr = 0.50
+        self.pending_long_entry_state = None
+        self.pending_short_entry_state = None
+        self.active_long_entry_state = None
+        self.active_short_entry_state = None
         # ======================================================
         # DEBUG COUNTERS
         # ======================================================
@@ -57,10 +75,13 @@ class SwordStrategyV03:
             "short_mother_open": 0, "long_mother_open": 0,
             "short_trigger_stored": 0, "long_trigger_stored": 0,
             "short_trigger_expired": 0, "long_trigger_expired": 0,
+            "short_addon_armed": 0, "long_addon_armed": 0,
             "short_addon_ready": 0, "long_addon_ready": 0,
+            "short_addon_rejected": 0, "long_addon_rejected": 0,
             "short_exit": 0, "long_exit": 0,
             "short_blocked_already_open": 0, "long_blocked_already_open": 0,
             "h4_blocked_long": 0, "h4_blocked_short": 0,
+            "long_early_failure_exit": 0, "short_early_failure_exit": 0,
         }
 
     # ======================================================
@@ -75,12 +96,18 @@ class SwordStrategyV03:
         else:
             self.long_exit_pending = False
             self.long_addon_count = 0
+            self.long_addon_pending = False
+            self.long_addon_armed = False
+            self.active_long_entry_state = None
 
         if self.short_mother_open:
             self.short_entry_pending = False
         else:
             self.short_exit_pending = False
             self.short_addon_count = 0
+            self.short_addon_pending = False
+            self.short_addon_armed = False
+            self.active_short_entry_state = None
 
     # ======================================================
     # EXECUTION CONFIRMATION CALLBACK
@@ -91,8 +118,16 @@ class SwordStrategyV03:
         if not success:
             if execution == "OPEN_LONG":
                 self.long_entry_pending = False
+                self.pending_long_entry_state = None
             elif execution == "OPEN_SHORT":
                 self.short_entry_pending = False
+                self.pending_short_entry_state = None
+            elif execution == "ADD_LONG":
+                self.long_addon_pending = False
+                self.debug["long_addon_rejected"] += 1
+            elif execution == "ADD_SHORT":
+                self.short_addon_pending = False
+                self.debug["short_addon_rejected"] += 1
             elif execution == "EXIT_LONG":
                 self.long_exit_pending = False
             elif execution == "EXIT_SHORT":
@@ -102,6 +137,8 @@ class SwordStrategyV03:
         if execution == "OPEN_LONG":
             self.long_entry_pending = False
             self.long_mother_open = True
+            self.active_long_entry_state = self.pending_long_entry_state
+            self.pending_long_entry_state = None
             self.short_mother_open = False
             self.short_trigger_ready = False
             self.long_trigger_ready = False
@@ -112,6 +149,8 @@ class SwordStrategyV03:
         elif execution == "OPEN_SHORT":
             self.short_entry_pending = False
             self.short_mother_open = True
+            self.active_short_entry_state = self.pending_short_entry_state
+            self.pending_short_entry_state = None
             self.long_mother_open = False
             self.short_trigger_ready = False
             self.long_trigger_ready = False
@@ -119,17 +158,33 @@ class SwordStrategyV03:
             self.long_trigger_age = 0
             self.debug["short_mother_open"] += 1
 
+        elif execution == "ADD_LONG":
+            self.long_addon_pending = False
+            self.long_addon_count += 1
+            self.long_addon_armed = False
+
+        elif execution == "ADD_SHORT":
+            self.short_addon_pending = False
+            self.short_addon_count += 1
+            self.short_addon_armed = False
+
         elif execution == "EXIT_LONG":
             self.long_mother_open = False
+            self.active_long_entry_state = None
             self.long_exit_pending = False
             self.long_addon_count = 0
+            self.long_addon_pending = False
+            self.long_addon_armed = False
             self.long_trigger_ready = False
             self.long_trigger_age = 0
 
         elif execution == "EXIT_SHORT":
             self.short_mother_open = False
+            self.active_short_entry_state = None
             self.short_exit_pending = False
             self.short_addon_count = 0
+            self.short_addon_pending = False
+            self.short_addon_armed = False
             self.short_trigger_ready = False
             self.short_trigger_age = 0
 
@@ -240,8 +295,6 @@ class SwordStrategyV03:
         # =====================================================
         lux_sell = lux_bear > lux_bull and lux_bear > 0
         lux_buy = lux_bull > lux_bear and lux_bull > 0
-        self.prev_lux_sell = False
-        self.prev_lux_buy = False
         lux_sell_event = lux_sell and not self.prev_lux_sell
         lux_buy_event = lux_buy and not self.prev_lux_buy
         if lux_sell: self.debug["lux_sell"] += 1
@@ -303,16 +356,56 @@ class SwordStrategyV03:
         direction = None
         execution = None
         # =====================================================
-        # SUPERTREND ATR EXIT EVENTS
-        # SHORT closes when candle close crosses above SuperTrend.
-        # LONG closes when candle close crosses below SuperTrend.
-        # EMA18 / EMA81 remains available for Add-On logic only.
+        # EARLY FAILURE EXIT V1.1
+        # Active only from bar 6 through bar 12 after confirmed entry.
+        # Exit when MFE remains below 0.50 ATR and price loses EMA18.
+        # =====================================================
+        early_failure_long = False
+        early_failure_short = False
+        early_failure_bars = None
+        early_failure_mfe_atr = None
+
+        if self.long_mother_open and self.active_long_entry_state:
+            state = self.active_long_entry_state
+            state["highest_price"] = max(float(state.get("highest_price", state["entry_price"])), float(engine["high"][i]))
+            early_failure_bars = max(0, i - int(state["entry_index"]))
+            mfe = max(0.0, float(state["highest_price"]) - float(state["entry_price"]))
+            early_failure_mfe_atr = mfe / float(state["entry_atr"]) if float(state["entry_atr"]) > 0.0 else 0.0
+            early_failure_long = (
+                self.early_failure_min_bars <= early_failure_bars <= self.early_failure_max_bars
+                and early_failure_mfe_atr < self.early_failure_min_mfe_atr
+                and float(engine["close"][i]) < float(ema18)
+            )
+
+        if self.short_mother_open and self.active_short_entry_state:
+            state = self.active_short_entry_state
+            state["lowest_price"] = min(float(state.get("lowest_price", state["entry_price"])), float(engine["low"][i]))
+            early_failure_bars = max(0, i - int(state["entry_index"]))
+            mfe = max(0.0, float(state["entry_price"]) - float(state["lowest_price"]))
+            early_failure_mfe_atr = mfe / float(state["entry_atr"]) if float(state["entry_atr"]) > 0.0 else 0.0
+            early_failure_short = (
+                self.early_failure_min_bars <= early_failure_bars <= self.early_failure_max_bars
+                and early_failure_mfe_atr < self.early_failure_min_mfe_atr
+                and float(engine["close"][i]) > float(ema18)
+            )
+
+        # =====================================================
+        # EXIT EVENTS — EARLY FAILURE HAS PRIORITY, THEN SUPERTREND
         # =====================================================
         if self.short_mother_open:
-            print("SHORT OPEN", i, "SUPERTREND EXIT=", exit_sell, "CLOSE=", round(engine["close"][i], 5), "SUPERTREND=", round(supertrend, 5))
+            print("SHORT OPEN", i, "EARLY FAILURE=", early_failure_short, "SUPERTREND EXIT=", exit_sell, "CLOSE=", round(engine["close"][i], 5), "SUPERTREND=", round(supertrend, 5))
         if self.long_mother_open:
-            print("LONG OPEN", i, "SUPERTREND EXIT=", exit_buy, "CLOSE=", round(engine["close"][i], 5), "SUPERTREND=", round(supertrend, 5))
-        if self.short_mother_open and not self.short_exit_pending and exit_sell:
+            print("LONG OPEN", i, "EARLY FAILURE=", early_failure_long, "SUPERTREND EXIT=", exit_buy, "CLOSE=", round(engine["close"][i], 5), "SUPERTREND=", round(supertrend, 5))
+
+        if self.short_mother_open and not self.short_exit_pending and early_failure_short:
+            event, direction = "SHORT_EXIT_EARLY_FAILURE", "EXIT"
+            self.short_exit_pending = True
+            self.debug["short_early_failure_exit"] += 1
+        elif self.long_mother_open and not self.long_exit_pending and early_failure_long:
+            event, direction = "LONG_EXIT_EARLY_FAILURE", "EXIT"
+            self.long_exit_pending = True
+            self.debug["long_early_failure_exit"] += 1
+        elif self.short_mother_open and not self.short_exit_pending and exit_sell:
             event, direction = "SHORT_EXIT", "EXIT"
             self.short_exit_pending = True
             self.debug["short_exit"] += 1
@@ -364,15 +457,128 @@ class SwordStrategyV03:
             print("MOTHER:", long_mother)
             print("=" * 70)
         # =====================================================
-        # ADD-ON CONDITIONS
+        # ADD-ON V3 HYBRID — CONTINUATION STRENGTH
+        #
+        # Original state-based Add-On philosophy:
+        #   Mother remains open
+        #   + at least 2 bars after Mother
+        #   + H4 / environment / EMA18-EMA81 / Lux remain aligned
+        #   + CCI reaches continuation strength
+        #
+        # Modern execution protection remains:
+        #   pending prevents duplicate requests
+        #   addon_count increases only after confirmed execution
         # =====================================================
-        short_addon = event is None and not self.short_exit_pending and self.short_mother_open and self.short_addon_count < 2 and self.in_short_environment and htf_router_ready and htf_short_allowed and ema18 < ema81 and lux_sell and lux_strength_ok
-        long_addon = event is None and not self.long_exit_pending and self.long_mother_open and self.long_addon_count < 2 and self.in_long_environment and htf_router_ready and htf_long_allowed and ema18 > ema81 and lux_buy and lux_strength_ok
+        short_bars_since_mother = (
+            i - int(self.active_short_entry_state["entry_index"])
+            if self.short_mother_open and self.active_short_entry_state
+            else 0
+        )
+        long_bars_since_mother = (
+            i - int(self.active_long_entry_state["entry_index"])
+            if self.long_mother_open and self.active_long_entry_state
+            else 0
+        )
+
+        short_addon_context = (
+            self.short_mother_open
+            and event is None
+            and not self.short_exit_pending
+            and not self.short_addon_pending
+            and self.short_addon_count < 2
+            and short_bars_since_mother >= self.addon_min_bars_after_mother
+            and self.in_short_environment
+            and htf_router_ready
+            and htf_short_allowed
+            and (self.ema18[i-1] >= self.ema81[i-1] and ema18 < ema81)
+            and lux_sell
+        )
+        long_addon_context = (
+            self.long_mother_open
+            and event is None
+            and not self.long_exit_pending
+            and not self.long_addon_pending
+            and self.long_addon_count < 2
+            and long_bars_since_mother >= self.addon_min_bars_after_mother
+            and self.in_long_environment
+            and htf_router_ready
+            and htf_long_allowed
+            and (self.ema18[i-1] <= self.ema81[i-1] and ema18 > ema81)
+            and lux_buy
+        )
+
         # =====================================================
-        # ADD-ON QUALITY
+        # ADD-ON V3 DIAGNOSTIC ONLY
+        # Prints the complete Add-On decision state while a Mother
+        # position is open. No trading condition is changed here.
         # =====================================================
-        short_addon_quality = abs(cci) >= 120 and lux_bear >= 10
-        long_addon_quality = abs(cci) >= 120 and lux_bull >= 10
+        if self.short_mother_open:
+            print("=" * 80)
+            print("[ADDON V3 DIAGNOSTIC SHORT]")
+            print("INDEX                    :", i)
+            print("BARS SINCE MOTHER        :", short_bars_since_mother)
+            print("CCI                      :", round(float(cci), 2))
+            print("CCI REQUIRED             :", -self.addon_cci_strength)
+            print("CCI STRENGTH OK          :", bool(cci <= -self.addon_cci_strength))
+            print("ENVIRONMENT OK           :", bool(self.in_short_environment))
+            print("HTF ROUTER READY         :", bool(htf_router_ready))
+            print("HTF SHORT ALLOWED        :", bool(htf_short_allowed))
+            print("EMA18 < EMA81            :", bool(ema18 < ema81))
+            print("LUX SELL                 :", bool(lux_sell))
+            print("EXIT PENDING             :", bool(self.short_exit_pending))
+            print("ADDON PENDING            :", bool(self.short_addon_pending))
+            print("ADDON COUNT              :", self.short_addon_count)
+            print("COUNT BELOW LIMIT        :", bool(self.short_addon_count < 2))
+            print("MIN BARS PASSED          :", bool(short_bars_since_mother >= self.addon_min_bars_after_mother))
+            print("FINAL ADDON CONTEXT      :", bool(short_addon_context))
+            print("=" * 80)
+
+        if self.long_mother_open:
+            print("=" * 80)
+            print("[ADDON V3 DIAGNOSTIC LONG]")
+            print("INDEX                    :", i)
+            print("BARS SINCE MOTHER        :", long_bars_since_mother)
+            print("CCI                      :", round(float(cci), 2))
+            print("CCI REQUIRED             :", self.addon_cci_strength)
+            print("CCI STRENGTH OK          :", bool(cci >= self.addon_cci_strength))
+            print("ENVIRONMENT OK           :", bool(self.in_long_environment))
+            print("HTF ROUTER READY         :", bool(htf_router_ready))
+            print("HTF LONG ALLOWED         :", bool(htf_long_allowed))
+            print("EMA18 > EMA81            :", bool(ema18 > ema81))
+            print("LUX BUY                  :", bool(lux_buy))
+            print("EXIT PENDING             :", bool(self.long_exit_pending))
+            print("ADDON PENDING            :", bool(self.long_addon_pending))
+            print("ADDON COUNT              :", self.long_addon_count)
+            print("COUNT BELOW LIMIT        :", bool(self.long_addon_count < 2))
+            print("MIN BARS PASSED          :", bool(long_bars_since_mother >= self.addon_min_bars_after_mother))
+            print("FINAL ADDON CONTEXT      :", bool(long_addon_context))
+            print("=" * 80)
+
+        short_addon_trigger = bool(short_addon_context)
+        long_addon_trigger = bool(long_addon_context)
+
+        short_addon = short_addon_trigger
+        long_addon = long_addon_trigger
+        short_addon_quality = short_addon
+        long_addon_quality = long_addon
+
+        if short_addon:
+            print(
+                "[SHORT ADDON V3 READY]",
+                "INDEX =", i,
+                "CCI =", round(cci, 2),
+                "COUNT =", self.short_addon_count,
+                "BARS =", short_bars_since_mother,
+            )
+        if long_addon:
+            print(
+                "[LONG ADDON V3 READY]",
+                "INDEX =", i,
+                "CCI =", round(cci, 2),
+                "COUNT =", self.long_addon_count,
+                "BARS =", long_bars_since_mother,
+            )
+
         print("MOTHER CHECK:", "SHORT_ENV=", self.in_short_environment, "TRIGGER=", self.short_trigger_ready, "EMA=", ema_sell, "LUX=", lux_sell, "LONG_ENV=", self.in_long_environment, "LONG_TRIGGER=", self.long_trigger_ready, "LONG_EMA=", ema_buy, "LONG_LUX=", lux_buy)
         # =====================================================
         # MOTHER ENTRY
@@ -402,6 +608,12 @@ class SwordStrategyV03:
             mother_opened_this_bar = True
             event, direction, execution = "SHORT_MOTHER", "SELL", "OPEN_SHORT"
             self.short_open_index = i
+            self.pending_short_entry_state = {
+                "entry_index": i,
+                "entry_price": float(engine["close"][i]),
+                "entry_atr": float(engine["atr"][i]),
+                "lowest_price": float(engine["close"][i]),
+            }
             print("=" * 60)
             print(">>> SHORT MOTHER EXECUTION REQUEST <<<")
             print("INDEX   :", i)
@@ -415,6 +627,12 @@ class SwordStrategyV03:
             mother_opened_this_bar = True
             event, direction, execution = "LONG_MOTHER", "BUY", "OPEN_LONG"
             self.long_open_index = i
+            self.pending_long_entry_state = {
+                "entry_index": i,
+                "entry_price": float(engine["close"][i]),
+                "entry_atr": float(engine["atr"][i]),
+                "highest_price": float(engine["close"][i]),
+            }
             print("=" * 60)
             print(">>> LONG MOTHER EXECUTION REQUEST <<<")
             print("INDEX   :", i)
@@ -425,13 +643,15 @@ class SwordStrategyV03:
         # ADD-ON EVENTS
         # =====================================================
         elif short_addon and short_addon_quality and not mother_opened_this_bar:
-            self.short_addon_count += 1
+            self.short_addon_pending = True
             self.debug["short_addon_ready"] += 1
             event, direction, execution = "SHORT_ADDON", "SELL", "ADD_SHORT"
+            print("[SHORT ADDON V3 EXECUTION REQUEST]", "INDEX =", i, "COUNT =", self.short_addon_count)
         elif long_addon and long_addon_quality and not mother_opened_this_bar:
-            self.long_addon_count += 1
+            self.long_addon_pending = True
             self.debug["long_addon_ready"] += 1
             event, direction, execution = "LONG_ADDON", "BUY", "ADD_LONG"
+            print("[LONG ADDON V3 EXECUTION REQUEST]", "INDEX =", i, "COUNT =", self.long_addon_count)
         # =====================================================
         # DEBUG
         # =====================================================
@@ -483,8 +703,8 @@ class SwordStrategyV03:
         elif event == "SHORT_MOTHER": execution = "OPEN_SHORT"
         elif event == "LONG_ADDON": execution = "ADD_LONG"
         elif event == "SHORT_ADDON": execution = "ADD_SHORT"
-        elif event == "LONG_EXIT": execution = "EXIT_LONG"
-        elif event == "SHORT_EXIT": execution = "EXIT_SHORT"
+        elif event in ("LONG_EXIT", "LONG_EXIT_EARLY_FAILURE"): execution = "EXIT_LONG"
+        elif event in ("SHORT_EXIT", "SHORT_EXIT_EARLY_FAILURE"): execution = "EXIT_SHORT"
         # =====================================================
         # FINAL H4 ROUTER SAFETY GUARD
         # =====================================================
@@ -524,6 +744,16 @@ class SwordStrategyV03:
             "long_exit_pending": self.long_exit_pending,
             "short_addon": short_addon,
             "long_addon": long_addon,
+            "short_addon_armed": self.short_addon_armed,
+            "long_addon_armed": self.long_addon_armed,
+            "short_addon_pending": self.short_addon_pending,
+            "long_addon_pending": self.long_addon_pending,
+            "short_addon_count": self.short_addon_count,
+            "long_addon_count": self.long_addon_count,
+            "short_bars_since_mother": short_bars_since_mother,
+            "long_bars_since_mother": long_bars_since_mother,
+            "short_addon_trigger": short_addon_trigger,
+            "long_addon_trigger": long_addon_trigger,
             "cci": cci,
             "cci_ma": cci_ma,
             "ema50": ema50,
@@ -536,7 +766,19 @@ class SwordStrategyV03:
             "supertrend_atr": supertrend_atr,
             "supertrend_atr_length": 18,
             "supertrend_atr_multiplier": 2,
-            "exit_reason": "SUPERTREND_ATR_18_2" if event in ("LONG_EXIT", "SHORT_EXIT") else None,
+            "is_exit_signal": execution in ("EXIT_LONG", "EXIT_SHORT"),
+            "exit_reason": (
+                "EARLY_FAILURE_V1_1"
+                if event in ("LONG_EXIT_EARLY_FAILURE", "SHORT_EXIT_EARLY_FAILURE")
+                else "SUPERTREND_ATR_18_2"
+                if event in ("LONG_EXIT", "SHORT_EXIT")
+                else None
+            ),
+            "early_failure_bars": early_failure_bars,
+            "early_failure_mfe_atr": early_failure_mfe_atr,
+            "early_failure_threshold_bars": self.early_failure_min_bars,
+            "early_failure_max_bars": self.early_failure_max_bars,
+            "early_failure_min_mfe_atr": self.early_failure_min_mfe_atr,
             "ema_sell": ema_sell,
             "ema_buy": ema_buy,
             "lux_bull": lux_bull,
